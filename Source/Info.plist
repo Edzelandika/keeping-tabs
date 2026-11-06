@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>SafariRecentTabs</string>
+<key>CFBundleIdentifier</key><string>local.safari-recent-tabs</string>
+<key>CFBundleName</key><string>Keeping Tabs</string>
+<key>CFBundleDisplayName</key><string>Keeping Tabs</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>8</string>
+<key>CFBundleShortVersionString</key><string>0.8</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>Read Safari tab titles and URLs to track recently used tabs and switch to the tab you select.</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>

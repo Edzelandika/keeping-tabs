@@ -1,0 +1,10 @@
+*.app/
+.DS_Store
+.build/
+.signing/
+*.p12
+*.pfx
+*.pem
+*.key
+*.keychain
+*.keychain-db
