@@ -2,8 +2,9 @@ import Foundation
 
 struct BridgeRequest: Codable {
     var action: String
-    var snapshot: TabSnapshot? = nil
+    var windowID: Int? = nil
     var index: Int? = nil
+    var expectedURL: String? = nil
 }
 struct BridgeReply: Codable {
     var snapshot: TabSnapshot? = nil
@@ -86,6 +87,15 @@ final class SafariScripts {
                 if (count of windows) is 0 then return {false, "Safari has no open window."}
                 set w to front window
                 if id of w is not windowID then return {false, "The active Safari window changed."}
+                if newIndex > 0 and newIndex <= (count of tabs of w) then
+                    set candidateURL to URL of tab newIndex of w
+                    if candidateURL is missing value then set candidateURL to ""
+                    if candidateURL is expectedURL then
+                        set current tab of w to tab newIndex of w
+                        if (index of current tab of w) is newIndex then return {true, ""}
+                        return {false, "Safari did not select the requested tab."}
+                    end if
+                end if
                 set actualURLs to URL of every tab of w
                 repeat with i from 1 to count of actualURLs
                     if item i of actualURLs is missing value then set item i of actualURLs to ""
@@ -130,15 +140,16 @@ final class SafariScripts {
             return BridgeReply(snapshot: TabSnapshot(windowID: Int(result.atIndex(1)?.int32Value ?? 0),
                 selected: Int(result.atIndex(2)?.int32Value ?? 0) - 1, tabs: tabs))
         }
-        guard request.action == "select", let snapshot = request.snapshot, let index = request.index,
-              snapshot.tabs.indices.contains(index) else { return BridgeReply(error: "Invalid selection") }
+        guard request.action == "select", let windowID = request.windowID, let index = request.index,
+              index >= 0, index < Int(Int32.max), let expectedURL = request.expectedURL,
+              Int32(exactly: windowID) != nil else { return BridgeReply(error: "Invalid selection") }
         let event = NSAppleEventDescriptor(eventClass: 0x61736372, eventID: 0x70736272,
             targetDescriptor: nil, returnID: -1, transactionID: 0) // ascr / psbr
         event.setParam(NSAppleEventDescriptor(string: "selecttab"), forKeyword: 0x736e616d) // snam
         let args = NSAppleEventDescriptor.list()
-        args.insert(NSAppleEventDescriptor(int32: Int32(snapshot.windowID)), at: 1)
+        args.insert(NSAppleEventDescriptor(int32: Int32(windowID)), at: 1)
         args.insert(NSAppleEventDescriptor(int32: Int32(index + 1)), at: 2)
-        args.insert(NSAppleEventDescriptor(string: snapshot.tabs[index].url), at: 3)
+        args.insert(NSAppleEventDescriptor(string: expectedURL), at: 3)
         event.setParam(args, forKeyword: 0x2d2d2d2d) // direct arguments
         let result = selector.executeAppleEvent(event, error: &error)
         if let error { return BridgeReply(error: error.description) }

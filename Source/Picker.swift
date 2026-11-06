@@ -1,9 +1,11 @@
 import AppKit
+import ImageIO
 
 final class SiteIcons {
     static let shared = SiteIcons()
     private let images = NSCache<NSString, NSImage>()
     private var attempted = Set<String>()
+    private var lastAddresses: [String] = []
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil
@@ -25,6 +27,9 @@ final class SiteIcons {
         return images.object(forKey: origin as NSString)
     }
     func load(_ tabs: [TabInfo], changed: @escaping () -> Void) {
+        let addresses = tabs.map(\.url)
+        guard addresses != lastAddresses else { return }
+        lastAddresses = addresses
         for tab in tabs {
             guard let origin = origin(tab.url), attempted.insert(origin).inserted,
                   let url = URL(string: origin + (URL(string: origin)?.host == "app.notion.com" ? "/images/favicon.ico" : "/favicon.ico")) else { continue }
@@ -33,12 +38,17 @@ final class SiteIcons {
             session.dataTask(with: request) { [weak self] data, response, _ in
                 guard let response = response as? HTTPURLResponse, response.statusCode == 200,
                       let data, data.count <= 1024 * 1024 else { return }
+                // Decode and rasterize before returning to the UI thread.
+                let options: [CFString: Any] = [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 32,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceShouldCacheImmediately: true
+                ]
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return }
                 DispatchQueue.main.async {
-                    guard let source = NSImage(data: data), source.isValid else { return }
-                    let icon = NSImage(size: NSSize(width: 32, height: 32))
-                    icon.lockFocus()
-                    source.draw(in: NSRect(x: 0, y: 0, width: 32, height: 32))
-                    icon.unlockFocus()
+                    let icon = NSImage(cgImage: bitmap, size: NSSize(width: 32, height: 32))
                     self?.images.setObject(icon, forKey: origin as NSString, cost: 16384)
                     changed()
                 }

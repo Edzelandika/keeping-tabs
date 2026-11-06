@@ -19,7 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var step = 0
     var frozen: TabSnapshot?
     var frozenOrder: [Int] = []
-    var wasSafari = false
+    var frontmostID = ""
+    var activationObserver: NSObjectProtocol?
+    var permissionTimer: Timer?
     var hud: NSPanel!
     var pickerReveal: DispatchWorkItem?
     var picker: TabPicker!
@@ -30,23 +32,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var setupLabel: NSTextField?
     var latestError = ""
     var lastSwitchError = ""
-    var lastDiagnosticData: Data?
+    var lastDiagnosticState: NSDictionary?
+    var diagnosticURL: URL {
+        URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("SafariRecentTabs-status-\(ProcessInfo.processInfo.processIdentifier).json")
+    }
 
     func writeDiagnostics() {
         let state: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier,
             "path": Bundle.main.bundlePath, "accessibility": AXIsProcessTrusted(),
-            "tap": tap != nil, "armed": armed, "reading": reading,
+            "tap": tap != nil, "armed": armed,
             "tabs": recent.snapshot?.tabs.count ?? 0, "error": latestError, "lastSwitchError": lastSwitchError,
-            "frontmost": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+            "frontmost": frontmostID,
             "status": statusLine?.title ?? "Starting"]
-        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]), data != lastDiagnosticData {
-            lastDiagnosticData = data
-            try? data.write(to: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("SafariRecentTabs-status-\(ProcessInfo.processInfo.processIdentifier).json"), options: .atomic)
+        let comparable = state as NSDictionary
+        if lastDiagnosticState != comparable,
+           let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) {
+            do {
+                try data.write(to: diagnosticURL, options: .atomic)
+                lastDiagnosticState = comparable
+            } catch { /* Retry on the next status update. */ }
         }
-        setupLabel?.stringValue = (statusLine?.title ?? "Starting") + "\n\n" +
+        guard setupWindow?.isVisible == true else { return }
+        let text = (statusLine?.title ?? "Starting") + "\n\n" +
             "Shortcut access: \(AXIsProcessTrusted() ? "Allowed" : "Needs permission")\n" +
             "Keyboard listener: \(tap == nil ? "Not active" : "Active")\n" +
             "Safari tabs loaded: \(recent.snapshot?.tabs.count ?? 0)\n\n" + (lastSwitchError.isEmpty ? latestError : lastSwitchError)
+        if setupLabel?.stringValue != text { setupLabel?.stringValue = text }
     }
 
     @objc func showStatus() {
@@ -65,8 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setupLabel = label
             window.center()
         }
-        writeDiagnostics()
         setupWindow?.makeKeyAndOrderFront(nil)
+        writeDiagnostics()
         NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -91,9 +102,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item("Quit Keeping Tabs", #selector(quit)))
         statusItem.menu = menu
         makeHUD()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.poll() }
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.foregroundChanged() }
+        // Permission recovery remains available even when Safari is inactive.
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.installTap()
+            self.writeDiagnostics()
+        }
+        foregroundChanged()
         showWelcome()
         showStatus()
+    }
+
+    func foregroundChanged() {
+        let next = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        if next != frontmostID {
+            revision += 1
+            cancel()
+            armed = false
+            frontmostID = next
+        }
+        updatePolling()
+        writeDiagnostics()
+    }
+
+    func updatePolling() {
+        timer?.invalidate()
+        timer = nil
+        guard frontmostID == safariID, !paused else { return }
+        poll()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.poll() }
     }
 
     func item(_ title: String, _ selector: Selector) -> NSMenuItem {
@@ -134,10 +174,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancel()
         armed = false
         statusLine.title = paused ? "Paused" : "Ready — Control-Tab in Safari"
+        updatePolling()
+        writeDiagnostics()
     }
     @objc func clear() { revision += 1; cancel(); recent = RecentTabs(); armed = false }
     @objc func quit() { bridge.stop(); NSApp.terminate(nil) }
-    func applicationWillTerminate(_ notification: Notification) { bridge.stop() }
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        permissionTimer?.invalidate()
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
+        try? FileManager.default.removeItem(at: diagnosticURL)
+        bridge.stop()
+    }
 
     func installTap() {
         guard tap == nil else { return }
@@ -155,6 +203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return app.handle(type, event)
             }, userInfo: Unmanaged.passUnretained(self).toOpaque())
         guard let tap else { statusLine.title = "Shortcut unavailable — check Accessibility"; return }
+        permissionTimer?.invalidate()
+        permissionTimer = nil
         tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
@@ -171,8 +221,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if type == .keyUp, suppressedKeys.remove(key) != nil {
             return nil
         }
-        let safari = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID
-        guard !paused, safari else {
+        // Unrelated keys need no workspace lookup or dispatch to the UI.
+        if !gesture && !(type == .keyDown && key == 48 && event.flags.contains(.maskControl)) {
+            return Unmanaged.passUnretained(event)
+        }
+        guard !paused, frontmostID == safariID else {
             if gesture { DispatchQueue.main.async { self.cancel() } }
             return Unmanaged.passUnretained(event)
         }
@@ -196,6 +249,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if type == .keyDown, key == 48, event.flags.contains(.maskControl),
            !event.flags.contains(.maskCommand), !event.flags.contains(.maskAlternate), armed {
+            // Validate focus only for a shortcut we are about to intercept.
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID else {
+                return Unmanaged.passUnretained(event)
+            }
             suppressedKeys.insert(key)
             let first = !gesture
             gesture = true
@@ -214,12 +271,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard tap != nil else { return }
         let safari = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID
         if !safari && !force {
-            if wasSafari { revision += 1; cancel() }
-            wasSafari = false
+            foregroundChanged()
             armed = false
             return
         }
-        wasSafari = true
         guard !gesture, frozen == nil, !reading, pendingSwitches == 0 else { return }
         reading = true
         let version = revision
@@ -283,7 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var predicted = snapshot
         predicted.selected = index
         recent.observe(predicted)
-        bridge.request(BridgeRequest(action: "select", snapshot: snapshot, index: index)) { [weak self] result in
+        bridge.request(BridgeRequest(action: "select", windowID: snapshot.windowID, index: index, expectedURL: snapshot.tabs[index].url)) { [weak self] result in
             guard let self else { return }
             self.pendingSwitches -= 1
             if result.error != nil || !result.switched {
