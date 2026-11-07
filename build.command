@@ -14,7 +14,7 @@ bundle="$build_temp/Keeping Tabs.app"
 mkdir -p "$bundle/Contents/MacOS"
 cp Source/Info.plist "$bundle/Contents/Info.plist"
 xcrun swiftc -swift-version 5 -module-cache-path "$module_cache" -O -framework AppKit -framework ApplicationServices \
-  Source/Recency.swift Source/Bridge.swift Source/Picker.swift Source/PickerKey.swift Source/main.swift \
+  Source/Recency.swift Source/Bridge.swift Source/Picker.swift Source/PickerKey.swift Source/RefreshScheduler.swift Source/main.swift \
   -o "$bundle/Contents/MacOS/SafariRecentTabs"
 codesign --force --sign "$signing_identity" --timestamp=none "$bundle"
 codesign --verify --deep --strict "$bundle"

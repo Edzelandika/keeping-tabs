@@ -39,13 +39,13 @@ When migrating from an old ad-hoc build, remove the previous permission entry an
 
 ## How it works
 
-Keyboard navigation uses cached tab data. Safari automation runs in a persistent helper process, keeping AppleScript calls off the interface thread. Background polling uses bulk title and URL queries, with only one poll outstanding. The switch handler validates the originating window and selected tab, then verifies Safari's selection. Errors appear in Status.
+Keyboard navigation uses cached tab data. Safari automation runs in a persistent helper process, keeping calls off the interface thread. Switching sends four explicit Apple events: validate the front window, fetch tab URLs, select the target, and verify its index. Routine full reads still use AppleScript. Mouse releases and likely tab-changing shortcuts schedule a full title/URL refresh after a 100 ms debounce. A five-second safety timer with one second of tolerance catches changes without input while Safari is active. Activation refreshes immediately. Successful app-driven switches update history in memory immediately and reconcile with Safari after a 250 ms quiet gap. Failed switches refresh immediately. Only one read runs at a time; requests arriving during a read or picker gesture are retained. The switch handler validates the originating window and selected tab, then verifies Safari's selection. Errors appear in Status. Last-switch timings show input dispatch, helper queue wait, helper execution (including Safari/IPC), callback delivery, and validation/selection/verification stages; they do not measure when Safari finishes painting the page. Timings are kept only in memory and shown in Status, without recording tab addresses or adding per-switch disk writes.
 
 Favicons load asynchronously from each HTTPS site's `/favicon.ico`, or Notion's `/images/favicon.ico`. Requests omit page paths, cookies, and credentials; no third-party icon service is used. The destination receives the requesting IP address, and sites may redirect requests. Images are cached in memory with a 256-icon / 4 MB cache budget. Failed requests retain the letter placeholder and are retried on the next launch. Custom page-specific icons may differ from Safari's icons.
 
 ## Scope and privacy
 
-The app works within the frontmost Safari window and its active Tab Group. It tracks visits after launch and polls up to four times per second while Safari is active, so extremely fast manual switches may be missed. Changing windows resets the current history. It does not start automatically at login.
+The app works within the frontmost Safari window and its active Tab Group. It tracks visits after launch. Very fast manual switches may be missed, and a click immediately followed by Control-Tab can use the previous cached history before the delayed refresh finishes. Background page changes may remain stale until the safety refresh. Changing windows resets the current history. It does not start automatically at login.
 
 Safari does not expose stable tab IDs through its scripting interface. Unique URLs can be matched across tab moves, but duplicate URLs, close-and-replace operations, and Tab Group changes can make identity ambiguous and reset history.
 
@@ -57,7 +57,8 @@ Tab titles and URLs, including private tabs when active, remain in memory. The a
 - `Source/Bridge.swift`: persistent helper and Safari automation.
 - `Source/Recency.swift`: recent-tab ordering.
 - `Source/Picker.swift`: picker drawing and icon cache.
-- `Source/PickerKey.swift`: picker key mappings.
+- `Source/PickerKey.swift`: picker keys and refresh-triggering shortcuts.
+- `Source/RefreshScheduler.swift`: debouncing and deferred read scheduling.
 - `Tests/`: standalone Swift checks for recency, key mappings, and helper communication.
 
 Compiled apps and signing keys are excluded from this repository. Each developer creates or supplies their own signing identity.

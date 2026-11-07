@@ -22,6 +22,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var frontmostID = ""
     var activationObserver: NSObjectProtocol?
     var permissionTimer: Timer?
+    var mouseMonitor: Any?
+    lazy var refreshScheduler = RefreshScheduler(canRead: { [weak self] in
+        guard let self else { return false }
+        return !self.paused && !self.gesture && self.frozen == nil &&
+            !self.reading && self.pendingSwitches == 0
+    }, read: { [weak self] forced in self?.performRead(force: forced) })
     var hud: NSPanel!
     var pickerReveal: DispatchWorkItem?
     var picker: TabPicker!
@@ -32,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var setupLabel: NSTextField?
     var latestError = ""
     var lastSwitchError = ""
+    var lastSwitchTiming = ""
     var lastDiagnosticState: NSDictionary?
     var diagnosticURL: URL {
         URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("SafariRecentTabs-status-\(ProcessInfo.processInfo.processIdentifier).json")
@@ -57,16 +64,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "Shortcut access: \(AXIsProcessTrusted() ? "Allowed" : "Needs permission")\n" +
             "Keyboard listener: \(tap == nil ? "Not active" : "Active")\n" +
             "Safari tabs loaded: \(recent.snapshot?.tabs.count ?? 0)\n\n" + (lastSwitchError.isEmpty ? latestError : lastSwitchError)
-        if setupLabel?.stringValue != text { setupLabel?.stringValue = text }
+        let details = text + (lastSwitchTiming.isEmpty ? "" : "\n\n" + lastSwitchTiming)
+        if setupLabel?.stringValue != details { setupLabel?.stringValue = details }
     }
 
     @objc func showStatus() {
         if setupWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 285), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 365), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Keeping Tabs — Status"
             window.isReleasedWhenClosed = false
             let label = NSTextField(wrappingLabelWithString: "Checking setup…")
-            label.frame = NSRect(x: 24, y: 72, width: 462, height: 190)
+            label.frame = NSRect(x: 24, y: 72, width: 512, height: 270)
             label.font = .systemFont(ofSize: 14)
             window.contentView?.addSubview(label)
             let button = NSButton(title: "Set Up Permissions…", target: self, action: #selector(setup))
@@ -105,10 +113,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.foregroundChanged() }
+        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .otherMouseUp]) { [weak self] _ in
+            self?.inputChanged()
+        }
         // Permission recovery remains available even when Safari is inactive.
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.installTap()
+            if self.tap != nil && self.frontmostID == safariID { self.poll() }
             self.writeDiagnostics()
         }
         foregroundChanged()
@@ -131,9 +143,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func updatePolling() {
         timer?.invalidate()
         timer = nil
+        refreshScheduler.cancel()
         guard frontmostID == safariID, !paused else { return }
         poll()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.poll() }
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshScheduler.requestIfNeeded()
+        }
+        timer?.tolerance = 1
+    }
+
+    func inputChanged() {
+        guard !paused, frontmostID == safariID else { return }
+        refreshScheduler.request()
     }
 
     func item(_ title: String, _ selector: Selector) -> NSMenuItem {
@@ -177,11 +198,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updatePolling()
         writeDiagnostics()
     }
-    @objc func clear() { revision += 1; cancel(); recent = RecentTabs(); armed = false }
+    @objc func clear() {
+        revision += 1
+        cancel()
+        recent = RecentTabs()
+        armed = false
+        updatePolling()
+        writeDiagnostics()
+    }
     @objc func quit() { bridge.stop(); NSApp.terminate(nil) }
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
         permissionTimer?.invalidate()
+        refreshScheduler.cancel()
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
         if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
         try? FileManager.default.removeItem(at: diagnosticURL)
         bridge.stop()
@@ -214,12 +244,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func handle(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            DispatchQueue.main.async { self.cancel() }
+            DispatchQueue.main.async { self.cancel(); self.inputChanged() }
             return Unmanaged.passUnretained(event)
         }
         let key = event.getIntegerValueField(.keyboardEventKeycode)
         if type == .keyUp, suppressedKeys.remove(key) != nil {
             return nil
+        }
+        // Observe only pass-through inputs likely to affect Safari tabs. Our own
+        // picker actions already refresh immediately after the switch completes.
+        if type == .keyDown, !gesture, !paused, frontmostID == safariID,
+           SafariRefreshKey.shouldRefresh(key, command: event.flags.contains(.maskCommand),
+                                          control: event.flags.contains(.maskControl)),
+           !(key == 48 && event.flags.contains(.maskControl) && armed &&
+             !event.flags.contains(.maskCommand) && !event.flags.contains(.maskAlternate)) {
+            DispatchQueue.main.async { self.inputChanged() }
         }
         // Unrelated keys need no workspace lookup or dispatch to the UI.
         if !gesture && !(type == .keyDown && key == 48 && event.flags.contains(.maskControl)) {
@@ -231,7 +270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if type == .flagsChanged, gesture, !event.flags.contains(.maskControl) {
             gesture = false
-            DispatchQueue.main.async { self.commit() }
+            let requestedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.async { self.commit(requestedAt: requestedAt) }
         }
         if type == .keyDown, gesture, let action = PickerKey.action(for: key) {
             suppressedKeys.insert(key)
@@ -240,7 +280,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async { self.cycle(first: false, direction: direction) }
             case .commit:
                 gesture = false
-                DispatchQueue.main.async { self.commit() }
+                let requestedAt = ProcessInfo.processInfo.systemUptime
+                DispatchQueue.main.async { self.commit(requestedAt: requestedAt) }
             case .cancel:
                 gesture = false
                 DispatchQueue.main.async { self.cancel() }
@@ -265,6 +306,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func poll(force: Bool = false) {
+        refreshScheduler.request(after: 0, force: force)
+    }
+
+    func performRead(force: Bool) {
         defer { writeDiagnostics() }
         guard !paused else { return }
         if tap == nil { installTap() }
@@ -282,10 +327,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.reading = false
             self.latestError = result.error ?? ""
-            defer { self.writeDiagnostics() }
+            defer { self.writeDiagnostics(); self.refreshScheduler.resume() }
             guard self.revision == version, !self.gesture, self.frozen == nil,
                   !self.paused, self.pendingSwitches == 0,
-                  (force || NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID) else { return }
+                  (force || NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID) else {
+                // A gesture or invalidated revision may have discarded this read.
+                // Preserve a fresh read for when the current operation finishes.
+                if !self.paused && self.frontmostID == safariID { self.inputChanged() }
+                return
+            }
             if let snapshot = result.snapshot, result.error == nil {
                 self.recent.observe(snapshot)
                 SiteIcons.shared.load(snapshot.tabs) { [weak self] in self?.picker.needsDisplay = true }
@@ -325,7 +375,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func commit() {
+    func commit(requestedAt: TimeInterval) {
+        let inputDelay = (ProcessInfo.processInfo.systemUptime - requestedAt) * 1000
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == safariID,
               let snapshot = frozen, frozenOrder.indices.contains(step) else { cancel(); return }
         let index = frozenOrder[step]
@@ -341,6 +392,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bridge.request(BridgeRequest(action: "select", windowID: snapshot.windowID, index: index, expectedURL: snapshot.tabs[index].url)) { [weak self] result in
             guard let self else { return }
             self.pendingSwitches -= 1
+            if let timing = result.timing {
+                self.lastSwitchTiming = String(format:
+                    "Last switch: input %.0f ms · queue %.0f ms\nHelper %.0f ms · callback %.0f ms",
+                    inputDelay, timing.queueMS, timing.helperMS, timing.callbackMS)
+                if let stages = result.stages {
+                    self.lastSwitchTiming += String(format:
+                        "\nValidate %.0f ms · select %.0f ms · verify %.0f ms",
+                        stages.validationMS, stages.selectionMS, stages.verificationMS)
+                }
+            }
             if result.error != nil || !result.switched {
                 self.revision += 1
                 self.armed = false
@@ -351,7 +412,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastSwitchError = ""
             }
             self.writeDiagnostics()
-            if self.pendingSwitches == 0 { self.poll() }
+            if self.pendingSwitches == 0 {
+                // Predicted history is already updated. Leave the helper available
+                // for another quick switch, then reconcile after a quiet gap.
+                self.refreshScheduler.request(after: self.lastSwitchError.isEmpty ? 0.25 : 0)
+            }
         }
     }
 
@@ -362,6 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         frozen = nil
         frozenOrder = []
         hud?.orderOut(nil)
+        // Commit calls cancel before marking a switch pending. Resume on the next
+        // turn so a queued read cannot slip ahead of that switch.
+        DispatchQueue.main.async { [weak self] in self?.refreshScheduler.resume() }
     }
 
     func makeHUD() {
