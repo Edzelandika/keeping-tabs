@@ -62,3 +62,8 @@ Tab titles and URLs, including private tabs when active, remain in memory. The a
 - `Tests/`: standalone Swift checks for recency, key mappings, and helper communication.
 
 Compiled apps and signing keys are excluded from this repository. Each developer creates or supplies their own signing identity.
+
+## Updates to-do
+
+- add "settings" page, allow user to configure verification step. Removing verification step may improve performance.
+- add option to change picker color, add translucence, etc.
